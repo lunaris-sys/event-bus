@@ -16,8 +16,8 @@ use anyhow::Result;
 use registry::ConsumerRegistry;
 use tracing::info;
 
-const PRODUCER_SOCKET: &str = "/run/lunaris/event-bus-producer.sock";
-const CONSUMER_SOCKET: &str = "/run/lunaris/event-bus-consumer.sock";
+const DEFAULT_PRODUCER_SOCKET: &str = "/run/lunaris/event-bus-producer.sock";
+const DEFAULT_CONSUMER_SOCKET: &str = "/run/lunaris/event-bus-consumer.sock";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,13 +28,18 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Read socket paths from environment, fall back to production defaults.
+    // This allows integration tests to use temporary paths without modifying
+    // the binary.
+    let producer_socket = std::env::var("LUNARIS_PRODUCER_SOCKET")
+        .unwrap_or_else(|_| DEFAULT_PRODUCER_SOCKET.to_string());
+    let consumer_socket = std::env::var("LUNARIS_CONSUMER_SOCKET")
+        .unwrap_or_else(|_| DEFAULT_CONSUMER_SOCKET.to_string());
+
     info!("starting event bus daemon");
 
-    // Create the shared registry. Arc::clone() is cheap (just increments a ref count).
-    // Each socket handler gets its own Arc clone pointing to the same registry.
     let registry = ConsumerRegistry::new();
-
-    socket::listen(PRODUCER_SOCKET, CONSUMER_SOCKET, registry).await?;
+    socket::listen(&producer_socket, &consumer_socket, registry).await?;
 
     Ok(())
 }
