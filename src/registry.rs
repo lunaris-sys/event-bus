@@ -7,6 +7,43 @@ use tracing::{debug, warn};
 /// A consumer that cannot keep up will lose events rather than stalling the bus.
 const CONSUMER_BUFFER: usize = 1024;
 
+/// UID filter for a consumer. Determines which user's events are delivered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UidFilter {
+    /// Receive events from all users (system consumers like graph-writer).
+    All,
+    /// Receive events only from this specific user.
+    Exact(u32),
+}
+
+impl UidFilter {
+    /// Parse a UID filter from the registration line.
+    /// "*" means all users, a number means that specific UID.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s == "*" {
+            Ok(UidFilter::All)
+        } else {
+            s.parse::<u32>()
+                .map(UidFilter::Exact)
+                .map_err(|e| format!("invalid UID filter '{s}': {e}"))
+        }
+    }
+
+    /// Check whether an event with the given UID passes this filter.
+    /// System events (uid=0) always pass regardless of filter.
+    pub fn accepts(&self, event_uid: u32) -> bool {
+        // System events (uid=0) are delivered to all consumers.
+        if event_uid == 0 {
+            return true;
+        }
+        match self {
+            UidFilter::All => true,
+            UidFilter::Exact(uid) => event_uid == *uid,
+        }
+    }
+}
+
 /// A registered consumer: an async task that reads from a Unix socket
 /// and wants to receive a filtered subset of events.
 struct ConsumerEntry {
@@ -16,8 +53,9 @@ struct ConsumerEntry {
     /// "file." matches all file events (prefix match).
     /// "*" matches everything.
     subscribed_types: Vec<String>,
+    /// UID filter: which user's events this consumer receives.
+    uid_filter: UidFilter,
     /// The sending half of the per-consumer channel.
-    /// Cloning this is cheap; it shares the same underlying queue.
     sender: mpsc::Sender<Event>,
 }
 
@@ -38,11 +76,6 @@ impl ConsumerEntry {
 
 /// Shared registry of all active consumers.
 /// Wrapped in `Arc<RwLock<...>>` so it can be shared across async tasks.
-///
-/// Arc = shared ownership across threads (like a thread-safe Rc in C#).
-/// `RwLock` = multiple readers OR one writer at a time.
-/// We read (dispatch) far more often than we write (register/unregister),
-/// so `RwLock` is the right choice over Mutex here.
 pub struct ConsumerRegistry {
     consumers: RwLock<Vec<ConsumerEntry>>,
 }
@@ -55,17 +88,17 @@ impl ConsumerRegistry {
     }
 
     /// Register a new consumer and return the receiving end of its channel.
-    /// The caller (the consumer socket handler) reads from this receiver
-    /// and forwards events over the Unix socket to the consumer process.
     pub async fn register(
         self: &Arc<Self>,
         id: String,
         subscribed_types: Vec<String>,
+        uid_filter: UidFilter,
     ) -> mpsc::Receiver<Event> {
         let (sender, receiver) = mpsc::channel(CONSUMER_BUFFER);
         let entry = ConsumerEntry {
             id: id.clone(),
             subscribed_types,
+            uid_filter,
             sender,
         };
         self.consumers.write().await.push(entry);
@@ -81,20 +114,21 @@ impl ConsumerRegistry {
     }
 
     /// Dispatch an event to all matching consumers.
-    /// Consumers that cannot keep up (full buffer) receive a warning and
-    /// the event is dropped for that consumer only.
+    /// Checks both event type pattern AND UID filter.
     pub async fn dispatch(self: &Arc<Self>, event: &Event) {
-        // Acquire a read lock: multiple dispatches can run concurrently.
         let consumers = self.consumers.read().await;
 
         for consumer in consumers.iter() {
+            // Check event type pattern match.
             if !consumer.matches(&event.r#type) {
                 continue;
             }
 
-            // try_send returns Err immediately if the buffer is full,
-            // rather than blocking. This is the backpressure mechanism:
-            // a slow consumer loses events but does not stall the bus.
+            // Check UID filter.
+            if !consumer.uid_filter.accepts(event.uid) {
+                continue;
+            }
+
             match consumer.sender.try_send(event.clone()) {
                 Ok(()) => {
                     debug!(
@@ -111,9 +145,6 @@ impl ConsumerRegistry {
                     );
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    // The receiver was dropped; the consumer disconnected
-                    // without calling unregister. Will be cleaned up on
-                    // next unregister call or registry sweep.
                     warn!(
                         consumer_id = %consumer.id,
                         "consumer channel closed unexpectedly"
@@ -128,7 +159,7 @@ impl ConsumerRegistry {
 mod tests {
     use super::*;
 
-    fn make_event(event_type: &str) -> Event {
+    fn make_event(event_type: &str, uid: u32) -> Event {
         Event {
             id: "01950000-0000-7000-8000-000000000001".to_string(),
             r#type: event_type.to_string(),
@@ -137,6 +168,7 @@ mod tests {
             pid: 1,
             session_id: "session-test".to_string(),
             payload: vec![],
+            uid,
         }
     }
 
@@ -145,6 +177,7 @@ mod tests {
         let entry = ConsumerEntry {
             id: "test".to_string(),
             subscribed_types: vec!["file.opened".to_string()],
+            uid_filter: UidFilter::All,
             sender: mpsc::channel(1).0,
         };
         assert!(entry.matches("file.opened"));
@@ -157,6 +190,7 @@ mod tests {
         let entry = ConsumerEntry {
             id: "test".to_string(),
             subscribed_types: vec!["file.".to_string()],
+            uid_filter: UidFilter::All,
             sender: mpsc::channel(1).0,
         };
         assert!(entry.matches("file.opened"));
@@ -169,6 +203,7 @@ mod tests {
         let entry = ConsumerEntry {
             id: "test".to_string(),
             subscribed_types: vec!["*".to_string()],
+            uid_filter: UidFilter::All,
             sender: mpsc::channel(1).0,
         };
         assert!(entry.matches("file.opened"));
@@ -180,10 +215,10 @@ mod tests {
     async fn dispatch_reaches_matching_consumer() {
         let registry = ConsumerRegistry::new();
         let mut receiver = registry
-            .register("consumer-1".to_string(), vec!["file.opened".to_string()])
+            .register("consumer-1".to_string(), vec!["file.opened".to_string()], UidFilter::All)
             .await;
 
-        registry.dispatch(&make_event("file.opened")).await;
+        registry.dispatch(&make_event("file.opened", 1000)).await;
 
         let event_received = receiver.try_recv().expect("should have received event");
         assert_eq!(event_received.r#type, "file.opened");
@@ -193,11 +228,89 @@ mod tests {
     async fn dispatch_skips_non_matching_consumer() {
         let registry = ConsumerRegistry::new();
         let mut receiver = registry
-            .register("consumer-1".to_string(), vec!["window.".to_string()])
+            .register("consumer-1".to_string(), vec!["window.".to_string()], UidFilter::All)
             .await;
 
-        registry.dispatch(&make_event("file.opened")).await;
+        registry.dispatch(&make_event("file.opened", 1000)).await;
 
         assert!(receiver.try_recv().is_err(), "should not have received event");
+    }
+
+    // ── UID Filtering Tests ──
+
+    #[tokio::test]
+    async fn test_uid_filtering_same_user() {
+        let registry = ConsumerRegistry::new();
+        let mut receiver = registry
+            .register("c1".to_string(), vec!["*".to_string()], UidFilter::Exact(1000))
+            .await;
+
+        registry.dispatch(&make_event("file.opened", 1000)).await;
+
+        assert!(receiver.try_recv().is_ok(), "same UID should be delivered");
+    }
+
+    #[tokio::test]
+    async fn test_uid_filtering_different_user() {
+        let registry = ConsumerRegistry::new();
+        let mut receiver = registry
+            .register("c1".to_string(), vec!["*".to_string()], UidFilter::Exact(1000))
+            .await;
+
+        registry.dispatch(&make_event("file.opened", 2000)).await;
+
+        assert!(receiver.try_recv().is_err(), "different UID should be filtered");
+    }
+
+    #[tokio::test]
+    async fn test_uid_filtering_system_events() {
+        let registry = ConsumerRegistry::new();
+        let mut receiver = registry
+            .register("c1".to_string(), vec!["*".to_string()], UidFilter::Exact(1000))
+            .await;
+
+        // uid=0 is a system event, should reach all consumers.
+        registry.dispatch(&make_event("schema.registered", 0)).await;
+
+        assert!(receiver.try_recv().is_ok(), "system event (uid=0) should reach all consumers");
+    }
+
+    #[tokio::test]
+    async fn test_wildcard_uid_filter() {
+        let registry = ConsumerRegistry::new();
+        let mut receiver = registry
+            .register("c1".to_string(), vec!["*".to_string()], UidFilter::All)
+            .await;
+
+        registry.dispatch(&make_event("file.opened", 1000)).await;
+        registry.dispatch(&make_event("file.opened", 2000)).await;
+        registry.dispatch(&make_event("schema.registered", 0)).await;
+
+        // All three should arrive.
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn uid_filter_parse() {
+        assert_eq!(UidFilter::parse("*").unwrap(), UidFilter::All);
+        assert_eq!(UidFilter::parse("1000").unwrap(), UidFilter::Exact(1000));
+        assert_eq!(UidFilter::parse("0").unwrap(), UidFilter::Exact(0));
+        assert!(UidFilter::parse("abc").is_err());
+        assert!(UidFilter::parse("").is_err());
+    }
+
+    #[test]
+    fn uid_filter_accepts() {
+        let all = UidFilter::All;
+        assert!(all.accepts(0));
+        assert!(all.accepts(1000));
+        assert!(all.accepts(2000));
+
+        let exact = UidFilter::Exact(1000);
+        assert!(exact.accepts(0));     // system events always pass
+        assert!(exact.accepts(1000));  // matching UID
+        assert!(!exact.accepts(2000)); // different UID
     }
 }

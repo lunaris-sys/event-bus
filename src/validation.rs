@@ -48,6 +48,7 @@ mod tests {
             pid: 1234,
             session_id: "session-abc".to_string(),
             payload: vec![],
+            uid: 1000,
         }
     }
 
