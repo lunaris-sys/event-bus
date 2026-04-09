@@ -169,6 +169,7 @@ mod tests {
             session_id: "session-test".to_string(),
             payload: vec![],
             uid,
+            project_id: String::new(),
         }
     }
 
